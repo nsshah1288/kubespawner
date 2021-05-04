@@ -587,3 +587,93 @@ def test_get_pvc_manifest():
         "heritage": "jupyterhub",
     }
     assert manifest.spec.selector == {"matchLabels": {"user": "mock-5fname"}}
+
+
+@pytest.mark.asyncio
+async def test_url_changed(kube_ns, kube_client, config, hub_pod, hub):
+    user = MockUser(name="url")
+    config.KubeSpawner.pod_connect_ip = (
+        "jupyter-{username}--{servername}.foo.example.com"
+    )
+    spawner = KubeSpawner(hub=hub, user=user, config=config)
+    spawner.db = Mock()
+
+    # start the spawner
+    res = await spawner.start()
+    pod_host = "http://jupyter-url.foo.example.com:8888"
+    assert res == pod_host
+
+    # Mock an incorrect value in the db
+    # Can occur e.g. by interrupting a launch with a hub restart
+    # or possibly weird network things in kubernetes
+    spawner.server = Server.from_url(res + "/users/url/")
+    spawner.server.ip = "1.2.3.4"
+    spawner.server.port = 0
+    assert spawner.server.host == "http://1.2.3.4:0"
+    assert spawner.server.base_url == "/users/url/"
+
+    # poll checks the url, and should restore the correct value
+    await spawner.poll()
+    # verify change noticed and persisted to db
+    assert spawner.server.host == pod_host
+    assert spawner.db.commit.call_count == 1
+    # base_url should be left alone
+    assert spawner.server.base_url == "/users/url/"
+
+    previous_commit_count = spawner.db.commit.call_count
+    # run it again, to make sure we aren't incorrectly detecting and committing
+    # changes on every poll
+    await spawner.poll()
+    assert spawner.db.commit.call_count == previous_commit_count
+
+    await spawner.stop()
+
+
+@pytest.mark.asyncio
+async def test_delete_pvc(kube_ns, kube_client, hub, config):
+    config.KubeSpawner.storage_pvc_ensure = True
+    config.KubeSpawner.storage_capacity = '1M'
+
+    spawner = KubeSpawner(
+        hub=hub,
+        user=MockUser(name="mockuser"),
+        config=config,
+        _mock=True,
+    )
+    spawner.api = kube_client
+
+    # start the spawner
+    await spawner.start()
+
+    # verify the pod exists
+    pod_name = "jupyter-%s" % spawner.user.name
+    pods = kube_client.list_namespaced_pod(kube_ns).items
+    pod_names = [p.metadata.name for p in pods]
+    assert pod_name in pod_names
+
+    # verify PVC is created
+    pvc_name = spawner.pvc_name
+    pvc_list = kube_client.list_namespaced_persistent_volume_claim(kube_ns).items
+    pvc_names = [s.metadata.name for s in pvc_list]
+    assert pvc_name in pvc_names
+
+    # stop the pod
+    await spawner.stop()
+
+    # verify pod is gone
+    pods = kube_client.list_namespaced_pod(kube_ns).items
+    pod_names = [p.metadata.name for p in pods]
+    assert "jupyter-%s" % spawner.user.name not in pod_names
+
+    # delete the PVC
+    await spawner.delete_forever()
+
+    # verify PVC is deleted, it may take a little while
+    for i in range(5):
+        pvc_list = kube_client.list_namespaced_persistent_volume_claim(kube_ns).items
+        pvc_names = [s.metadata.name for s in pvc_list]
+        if pvc_name in pvc_names:
+            time.sleep(1)
+        else:
+            break
+    assert pvc_name not in pvc_names
